@@ -1,0 +1,310 @@
+---
+title: "Single Cell RNA-seq Analysis of Human Colon"
+author:
+- 'Mariachiara Grieco mariachiara.grieco@studenti.unimi.it'
+date: "30 September 2021"
+output:   
+  rmdformats::robobook:
+    self_contained: true
+    df_print: paged
+key: Transcriptomics Course 2021
+--- 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Abstract
+Aim of this analysis is performing a single-cell RNA analysis of a human colon sample studied in ["Structural Remodeling of the Human Colonic Mesenchyme in Inflammatory Bowel Disease" (Kinchen J. et al. 2018)](https://pubmed.ncbi.nlm.nih.gov/30270042/) to define how the colonic mesenchyme remodels to fuel inflammation and barrier dysfunction in IBD (Inflammatory Bowel Disease).
+
+# Data and methods
+The dataset is collected in [PanglaoDB](https://panglaodb.se/index.html), a database of single cell RNA sequencing experiments from mouse and human integrated in a unified framework. 
+The data are stored under the accession number ([SRA703206](https://panglaodb.se/view_data.php?sra=SRA703206&srs=SRS3296611)).
+
+About the experimental details, the sample library was sequencing using as instrument Illumina HiSeq 4000 and the 10X chromium protocol.
+
+The general workflow of the computational analysis here described is based on [Seurat](https://satijalab.org/seurat/) and follows the [Seurat vignette](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html).
+
+These are the main libraries used:
+```{r libraries}
+# Importing libraries
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+
+```
+
+
+# Loading data
+Firstly, we download the data from PanglaoDB as RData containing the sparse matrix from PanglaoDB.
+IN the matrix, rows are genes and columns are cells, the counts are not normalized.
+After loading the data, we perform a "string manipulation" on the row.names in order to keep only the gene symbol and remove the ENSEMBL ID (ENSG_).
+
+```{r}
+wd <- "/home/mariachiara/Desktop/University/transcript/project/sc/"
+load(paste0(wd,"SRA703206_SRS3296611.sparse.RData"))
+sc_data <- sm
+row.names(sc_data) <- sapply(strsplit(row.names(sc_data), "\\_"), "[[", 1)
+remove(sm)
+```
+
+Now, we trasform the count matrix into the SeuratObject, that is useful being a container for both data (like the count matrix) and analysis (like PCA, or clustering results) for a single-cell dataset.
+In creating the SeuratObject we use as thresholds:
+
+*   min.cells: the minimum number of cells in which a gene can be detected
+*   min.features is the minimum number of genes that have to be expressed in a cell.
+
+“Features” is the way to refer to genes. 
+Genes/Cells not satisfying these constrains are discarded a priori.
+
+```{r SeuratObject}
+colon <- CreateSeuratObject(counts = sc_data, project = "sc_colon", min.cells = 3, min.features = 200)
+colon
+```
+Our table we will use in the downstream analysis contains:
+
+*   25,052 genes
+*   5,997 cells 
+
+
+# QC
+As first step, we perform a quality control on cells.
+QC metrics commonly used include:
+
+*   Number of unique genes (features) detected in each cell: cells with few genes may be low-quality cells or empty droplets, while the ones with an aberrantly high gene count may be doublets.
+*   Number of reads (correlates strongly with unique genes)
+*   Percentage of mitochondrial reads: cells with a too high percentage of mt reads often are low-quality or dying cells.
+
+## Mitochondrial QC
+We calculate mitochondrial QC metrics with the `PercentageFeatureSet()` function, which calculates the percentage of counts originating from a set of genes (selected according to name). In this case, we use the set of all genes with name starting with MT- to identify mitochondrial genes.
+
+```{r mithocondrial}
+colon[["percent.mt"]] <- PercentageFeatureSet(colon, pattern = "^MT-")
+colon@meta.data
+
+```
+
+By looking at these violin plots, we can have a visualization of the QC metrics described:
+
+```{r violinplots QC}
+VlnPlot(colon, 
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+        ncol = 3, 
+        cols = "#3399FF",
+        pt.size=0)
+
+```
+
+
+We can also observe the scatter of the features, typically used to visualize feature-feature relationships.
+The intercept in the plots shows the thresholds to carry out the removal of "low-quality cells".
+
+```{r featurescatter}
+plot1 <- FeatureScatter(colon, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = "#3399FF") +
+  geom_hline(yintercept=25, colour="black")
+plot2 <- FeatureScatter(colon, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",cols = "#3399FF") +
+  geom_hline(yintercept=4000, colour="black") +
+  geom_hline(yintercept=200, colour="black")
+plot1 + plot2
+
+```
+
+
+From these scatter plots, we can notice a negative correlation between the number of reads and the percentage of mitochondrial genes, while a strong positive one (as said before in explaining the QC metrics) between the number of reads and the number of unique genes.
+
+Overall, by looking at these plots, we can set as threshold for the parameters:
+
+* A number of unique genes expressed lower than 200 (low quality cells/empty droplets) or higher than 4000 (doublets);
+* A percentage of mitochondrial genes higher than 25.
+
+and remove the "low quality cells".
+
+```{r filtering}
+colon_hq <- subset(colon, subset = nFeature_RNA > 200 & nFeature_RNA < 4000 & percent.mt < 25)
+colon_hq
+```
+
+After the removal of the "low quality cells", we obtain 5,211 cells.
+
+# Normalizing the data
+So, we proceed with the normalization of the data using `NormalizeData()` function. 
+By default, Seurat normalizes the gene counts for each cell by the total counts for each cell, multiplies this by a scale factor (10,000 by default), and log-transforms the counts. 
+
+```{r log-normalizing}
+colon_hq <- NormalizeData(colon_hq, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+# Identification of highly variable features
+Then, we have to select in our gene set the genes that show the highest cell-to-cell variation (measured by the relationship between variance and mean), the "most variable genes".
+This can be done using the function `FindVariableFeatures()`.
+By default, the top 2000 variable genes are kept for all downstream analyses; we can take a different number of variable genes by changing the value of nfeatures parameter.
+
+```{r highly variable features}
+colon_hq <- FindVariableFeatures(colon_hq, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(colon_hq), 10)
+paste("The top 10 most variable genes are:", paste(top10, collapse=", "))
+
+```
+
+Here we can visualize in red the 2,000 most variable genes, among which the top 10 ones are labeled with the gene symbol.
+
+```{r plot highly variable features}
+plot3 <- VariableFeaturePlot(colon_hq)
+plot3 <- LabelPoints(plot = plot3, points = top10, repel = TRUE, xnudge = 0, ynudge = 0)
+plot3
+```
+
+# Data scaling 
+By this step, all log-normalized counts are transformed so that they have mean 0 and variance 1 across all cells, regardless of the count values (high or low). 
+This leads to a sort of “ternarization”, according to which for each cell a gene will be tend “up” (>0) “average” (=0) or “down” (<0) with very close values.
+
+```{r scaling}
+colon_hq <- ScaleData(colon_hq, features=rownames(colon_hq))
+```
+
+In performing the scaling, we can also regress out unwanted sources of variation that can be present.
+An example of source of variation between cells is the cell cycle effect.
+To evaluate its impact on our dataset, we have to assign each cell a score, that is based on its expression of G2/M and S phase marker genes; then, we plot the cells in a lower dimensionality space (running a PCA) to assess if cells cluster by the predicted cell cycle. 
+
+```{r cell phase}
+# Cell phase prediction
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+colon_hq <- CellCycleScoring(colon_hq, s.features=s.genes, g2m.features=g2m.genes, set.ident=TRUE)
+head(colon_hq[[]])
+
+```
+
+
+Looking at the plot, it is no revelead a clear separation between cells, so we have not to regress out cell cycle scores during data scaling. 
+
+```{r visualization cell phase}
+# Linear dimensionality reduction with PCA
+colon_hq <- RunPCA(colon_hq, features=VariableFeatures(object=colon_hq))
+
+# Visualization in a lower dimensionality space
+DimPlot(colon_hq, reduction="pca")
+```
+
+
+# Choosing dimensions 
+The next step is choosing how many principal components (dimensions) keep for the subsequent clustering, that can be done using the “elbow” plot. It is a ranking of principle components based on the percentage of variance explained by each one. 
+
+```{r elbow}
+ElbowPlot(colon_hq, ndims = 50) + geom_vline(colour = "red", xintercept = 22)
+```
+
+
+The optimal number of PC seems to be 22 (red line), as after that number there is no significant variation in the explained variability. 
+
+
+# Clustering the cells
+Among the different ways to perform the clustering, Seurat uses a KNN graph-based method using the Euclidean distance as distance in PCA space.
+Ratio: two cells are "close" if they are close in the PCA space and if they share the most fo the closest cells.
+`FindNeighbors()` builds the KNN graph, the `dims` parameter can be set with the chosen number of PC.
+The `FindClusters()` function implements a modularity optimization technique (by default the Louvain algorithm) to dividing the cells into clusters. The `resolution` parameter can be set to change the granularity for the clusters.
+Then, to visualizing clusters of cells based on scRNA data the PCA plot is not the best method; instead, the t_SNE or especially UMAP, non linear dimensionality reduction methods, are the preferrable ones.
+In order to visualize the clusters obtained, we use the function `RunUMAP()`, from the package [umap](https://umap-learn.readthedocs.io/en/latest/), in which we specify "umap" in `reduction` parameter.
+
+Firstly, we perform a clustering using as value for `dims` and `resolution` parameters the same used in the Seurat vignette.
+
+```{r clustering, warning=FALSE}
+colon_hq <- FindNeighbors(colon_hq, dims = 1:10)
+colon_hq <- FindClusters(colon_hq, resolution = 0.5)
+colon_hq <- RunUMAP(colon_hq, dims = 1:10)
+DimPlot(colon_hq, reduction = "umap", label = TRUE)
+```
+
+```{r}
+table(colon_hq@meta.data$seurat_clusters)
+
+```
+
+
+
+
+According to the elbow previously observed, we perform also a clustering using a number of PC equal to 22 to get better results.
+
+```{r new parameters for clustering}
+colon_hq <- FindNeighbors(colon_hq, dims = 1:22)
+colon_hq <- FindClusters(colon_hq, resolution = 0.5)
+colon_hq <- RunUMAP(colon_hq, dims = 1:22)
+DimPlot(colon_hq, reduction = "umap", label = TRUE)
+```
+
+
+# Finding markers
+The final step aims to find which are the “marker genes” (expressed exclusively, or at least over-expressed) in each cluster with respect to the others, in order to identify the clusters obtained and assign the cell type.
+
+The function `FindAllMarkers()` allows to find the differentially expressed genes for all the clusters with respect to the others.
+The parameters that can be tuned are:
+
+*   min.pct: minimum fraction of cells in which genes must be express; in this case, we take gene expressed in at least 25% of the cells
+*   logfc.threshold: log2 fold change of at least 0.25
+
+```{r finding markers}
+colon.markers_22 <- FindAllMarkers(colon_hq, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+
+Here, we store in a table the top 10 marker genes found for each cluster and then visualize them with the heatmap in which is reported their expression.
+
+```{r top10 marker genes, fig.height=15, fig.width=15}
+top10_22 <- colon.markers_22 %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+top10_22
+DoHeatmap(colon_hq, features = top10_22$gene)
+```
+
+
+Moreover, for each cluster we can assess the specificity of a marker gene to the cluster with two kind of plots:
+
+* the violin plots show the distribution of gene expression for each cell in each cluster
+* the UMAP plot integrated with a heatmap show how much a gene is expressed in each cluster.
+
+
+```{r markers expression, fig.height=15}
+VlnPlot(colon_hq, features = c("CCL13", "F3", "AREG", "MZB1", "MMP1",
+    "PLVAP", "GPM6B", "OGN","RGS5","SOSTDC1","KLRB1"), pt.size = 0, ncol = 2)
+
+FeaturePlot(colon_hq, features = c("CCL13", "F3", "AREG", "MZB1", "MMP1",
+    "PLVAP", "GPM6B", "OGN","RGS5","SOSTDC1","KLRB1"), pt.size = 0, ncol = 2)
+```
+
+
+Here, we can investigate the expression of the marker genes in the cluster 0.
+```{r expression top10 genes cluster 0, fig.height=20}
+VlnPlot(colon_hq, features = c("CCL2","VMP1","NFKBIZ"), pt.size = 0.1, ncol = 2)
+```
+
+```{r}
+FeaturePlot(colon_hq, features =  c("CCL2","VMP1","NFKBIZ"), pt.size = 0, ncol = 2)
+
+```
+
+
+# Assigning cell type identity
+The cell type is then assigned to each of the clusters searching in [PanglaoDB](https://panglaodb.se/search.html) and in literature to what cell type the expression of the marker genes is associated.
+The final results of our analysis is represented in the UMAP plot, in which we specify the cell type found as cluster label.
+
+```{r assignment cell type}
+new.cluster.ids <- c("Unknown", rep("Fibroblasts", 2), "Epithelial cells", "Plasma cells",
+    "Fibroblasts", "Endothelial cells","Glia cells","Fibroblasts", rep("Smooth muscle cells",2), "T cells")
+
+names(new.cluster.ids) <- levels(colon_hq)
+colon_hq <- RenameIdents(colon_hq, new.cluster.ids)
+DimPlot(colon_hq, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+
+```{r}
+table(colon_hq@meta.data$seurat_clusters)
+```
+
+
+# Session info
+```{r}
+sessionInfo()
+```
+
+
